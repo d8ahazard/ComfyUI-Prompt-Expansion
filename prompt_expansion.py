@@ -1,3 +1,4 @@
+import math
 import os
 import random
 import sys
@@ -13,7 +14,7 @@ sys.stdout = open(os.devnull, 'w')
 
 # Import the required modules
 import comfy.model_management as model_management
-from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
+from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed, LogitsProcessorList
 from comfy.model_patcher import ModelPatcher
 from .util import join_prompts, remove_empty_str
 
@@ -22,6 +23,11 @@ sys.stdout = original_stdout
 
 fooocus_expansion_path = os.path.abspath(os.path.join(os.path.dirname(__file__),
                                                       'fooocus_expansion'))
+
+# limitation of np.random.seed(), called from transformers.set_seed()
+SEED_LIMIT_NUMPY = 2 ** 32
+neg_inf = - 8192.0
+
 fooocus_magic_split = [
     ', extremely',
     ', intricate,',
@@ -44,7 +50,18 @@ def remove_pattern(x, pattern):
 
 class FooocusExpansion:
     def __init__(self):
+        path_foooocus_expansion = os.path.abspath(os.path.dirname(__file__))
         self.tokenizer = AutoTokenizer.from_pretrained(fooocus_expansion_path)
+        positive_words = open(os.path.join(path_foooocus_expansion, 'positive.txt'),
+                              encoding='utf-8').read().splitlines()
+        positive_words = ['Ġ' + x.lower() for x in positive_words if x != '']
+        self.logits_bias = torch.zeros((1, len(self.tokenizer.vocab)), dtype=torch.float32) + neg_inf
+        debug_list = []
+        for k, v in self.tokenizer.vocab.items():
+            if k in positive_words:
+                self.logits_bias[0, v] = 0
+                debug_list.append(k[1:])
+        print(f'Fooocus V2 Expansion: Vocab with {len(debug_list)} words.')
         self.model = AutoModelForCausalLM.from_pretrained(fooocus_expansion_path)
         self.model.eval()
 
@@ -61,28 +78,46 @@ class FooocusExpansion:
 
         # print(f'Fooocus Expansion engine loaded for {load_device}.')
 
+    @torch.no_grad()
+    @torch.inference_mode()
+    def logits_processor(self, input_ids, scores):
+        assert scores.ndim == 2 and scores.shape[0] == 1
+        self.logits_bias = self.logits_bias.to(scores)
+        bias = self.logits_bias.clone()
+        bias[0, input_ids[0].to(bias.device).long()] = neg_inf
+        bias[0, 11] = 0
+        return scores + bias
+
+    @torch.no_grad()
+    @torch.inference_mode()
     def __call__(self, prompt, seed):
+        if prompt == '':
+            return ''
         model_management.load_model_gpu(self.patcher)
-        seed = int(seed)
+        seed = int(seed) % SEED_LIMIT_NUMPY
         set_seed(seed)
-        origin = safe_str(prompt)
-        prompt = origin + fooocus_magic_split[seed % len(fooocus_magic_split)]
+        prompt = safe_str(prompt) + ','
 
         tokenized_kwargs = self.tokenizer(prompt, return_tensors="pt")
         tokenized_kwargs.data['input_ids'] = tokenized_kwargs.data['input_ids'].to(self.patcher.load_device)
         tokenized_kwargs.data['attention_mask'] = tokenized_kwargs.data['attention_mask'].to(self.patcher.load_device)
 
+        current_token_length = int(tokenized_kwargs.data['input_ids'].shape[1])
+        max_token_length = 75 * int(math.ceil(float(current_token_length) / 75.0))
+        max_new_tokens = max_token_length - current_token_length
+        if max_new_tokens == 0:
+            return prompt[:-1]
         # https://huggingface.co/blog/introducing-csearch
         # https://huggingface.co/docs/transformers/generation_strategies
         features = self.model.generate(**tokenized_kwargs,
-                                       num_beams=1,
-                                       max_new_tokens=256,
-                                       do_sample=True)
+                                       top_k=100,
+                                       max_new_tokens=max_new_tokens,
+                                       do_sample=True,
+                                       logits_processor=LogitsProcessorList([self.logits_processor]))
 
         response = self.tokenizer.batch_decode(features, skip_special_tokens=True)
-        result = response[0][len(origin):]
-        result = safe_str(result)
-        result = remove_pattern(result, dangrous_patterns)
+        result = safe_str(response[0])
+
         return result
 
 
